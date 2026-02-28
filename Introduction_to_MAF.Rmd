@@ -1,0 +1,169 @@
+---
+title: "Introduction to MAF"
+author: Erika Li, Jeanne Revilla, Mahija Mogalipuvvu, adapted from Nicole Black, Wade Boohar
+date: 07/17/22
+updated: 9/29/2025
+---
+
+***Deliverables***
+- upload this R Notebook to your GitHub and submit the link to your Repo on Brightspace
+- include ALL graphs or figures created in this assignment in a folder with your R notebook with descriptive file names.
+
+We encourage you to work with a partner. Therefore, it is okay if your answers are the same as your partner’s as long as everyone understands it and could explain it in their own words if asked. Each person must individually push their code to Github. *At the top of your R Notebook, write the name of you and your partner(s) as a comment.*
+
+***Complete the following coding activity and answer any following questions as comments in your R Notebook***
+
+In this assignment, you will need to use your skills learned in class to demonstrate your understanding of categorical variables and R data structures.
+
+*Pre-Assignment*
+Load all necessary packages, read in the clinical data.csv file you have in your analysis_data folder, and instantiate the MAF_object.
+```{r}
+library(BiocManager)
+library(TCGAbiolinks)
+library(maftools)
+
+knitr::opts_knit$set(root.dir = normalizePath("/home1/bojialiu/490_Cluster/analysis_data"))
+```
+
+```{r}
+clinic <- read.csv("/home1/bojialiu/490_Cluster/analysis_data/brca_clinical_data.csv")
+
+# Instantiate MAF object
+maf_query <- GDCquery(
+  project = "TCGA-BRCA",
+  data.category = "Simple Nucleotide Variation",
+  access = "open",
+  data.type = "Masked Somatic Mutation",
+  workflow.type = "Aliquot Ensemble Somatic Variant Merging and Masking"
+)
+```
+
+
+```{r}
+#GDCdownload(maf_query, method = "api", files.per.chunk = 100)
+# Add this line right after
+colnames(clinic)[colnames(clinic) == "bcr_patient_barcode"] <- "Tumor_Sample_Barcode"
+
+# Then instantiate MAF object
+maf_object <- read.maf(maf = maf,
+                       clinicalData = clinic,
+                       isTCGA = TRUE)
+maf <- GDCprepare(maf_query)
+
+maf_object <- read.maf(maf = maf,
+                       clinicalData = clinic,
+                       isTCGA = TRUE)
+```
+
+It's useful to save your MAF_object, so that you don't have to go through the trouble of querying and preparing it everytime. The saveRDS function allows us to save an R object, allowing us to access it directly from our files. 
+```{r}
+saveRDS(maf_object, file = "/home1/bojialiu/490_Cluster/analysis_data/maf_object.rds")
+# ex. saveRDS(MAF_object, file = "/home1/erika/490_cluster/analysis_data/maf_object.rds")
+```
+
+When you reopen a new R session and want to access your MAF_object, you can use the readRDS function to load the object back into a new variable.
+```{r}
+MAF_object <- readRDS(file = "/home1/bojialiu/490_Cluster/analysis_data/maf_object.rds")
+# ex. MAF_object <- readRDS(file = "/home1/erika/490_cluster/analysis_data/maf_object.rds")
+```
+
+*1*
+Choose a clinical variable (or any variable from clin_rad or clin_drug) to separate your populations into two different groups and rewrite the column or create a new column with that variable as a factor. ***Do not use age or vital_status as your clinical variable.*** Hint: if your variable is continuous, you will need to determine your own cutoffs for the different levels of the factor. If your variable is categorical and has more than two possible values, choose the two that are the most common.
+```{r}
+table(clinic$tumor_status)
+
+clinic$tumor_status_factor <- factor(clinic$tumor_status,
+                                     levels = c("WITH TUMOR", "TUMOR FREE"))
+
+mask <- clinic$tumor_status %in% c("WITH TUMOR", "TUMOR FREE")
+clinic <- clinic[mask, ]
+```
+
+
+*2*
+Create a co-oncoplot with the top 10-20 (you choose) most mutated genes for the two groups. Pick one that has a large discrepancy in % mutated or type of mutations between the groups and research it. 
+Research it. What is the gene used for? Can you think of any reason for the discrepancy?
+```{r}
+with_tumor_maf <- subsetMaf(maf = maf_object,
+                             tsb = clinic$Tumor_Sample_Barcode[clinic$tumor_status == "WITH TUMOR"])
+
+tumor_free_maf <- subsetMaf(maf = maf_object,
+                             tsb = clinic$Tumor_Sample_Barcode[clinic$tumor_status == "TUMOR FREE"])
+
+coOncoplot(m1 = with_tumor_maf,
+           m2 = tumor_free_maf,
+           m1Name = "With Tumor",
+           m2Name = "Tumor Free",
+           genes = getGeneSummary(maf_object)$Hugo_Symbol[1:15])
+```
+We observe an increase in mutation percentage of TP53 in tumors. TP53 is a tumor suppressor gene that takes care of DNA repair and stops cell division. It makes sense to see the gene mutating more in the tumor, as the lack of normally funciton TP53 would cause cells to stay alive even after DNA damage,  
+
+*3*
+Create a contingency table with your variable and chosen gene. Run a Fisher’s Exact Test between presence of mutations for that gene and your clinical variable. Create and save a mosaic plot. 
+Interpret the output of the Fisher’s Exact Test in terms of the odds ratio and p-value.
+```{r}
+tp53_mutated_barcodes <- maf_object@data$Tumor_Sample_Barcode[maf_object@data$Hugo_Symbol == "TP53"]
+
+clinic$TP53_mutated <- ifelse(clinic$Tumor_Sample_Barcode %in% tp53_mutated_barcodes,
+                               "Mutated", "Not Mutated")
+
+contig <- table(clinic$tumor_status, clinic$TP53_mutated)
+contig
+
+fisher_test <- fisher.test(contig)
+fisher_test
+
+jpeg("TP53_tumor_status_mosaic.jpg")
+mosaicplot(contig,
+           main = "TP53 Mutation vs Tumor Status",
+           xlab = "Tumor Status",
+           ylab = "TP53 Mutation",
+           color = c("lightblue", "salmon"))
+dev.off()
+```
+The odds ratio of 0.77, meaning that those without tumor have a 0.77x odds of having a mutation in the TP53 gene compared to those with tumor. As for the p value of 0.28, which is significantly larger than 0.05, indicating that the association between TP53 gene and the presenceo of tumor is not statistically significant. This might be due to the fact that there a quite few samples of patients with tumor, compared to those without.
+
+*4*
+Subset your maf_object based on your chosen clinical variable and create a co-lollipop plot of your chosen gene divided between the two different clinical variable possibilities. Include descriptive names on your plot.
+Do you notice any difference in terms of mutations (e.g. sites, types, number) between the two populations?
+```{r}
+
+with_tumor_maf <- subsetMaf(maf = maf_object,
+                             tsb = clinic$Tumor_Sample_Barcode[clinic$tumor_status == "WITH TUMOR"])
+
+tumor_free_maf <- subsetMaf(maf = maf_object,
+                             tsb = clinic$Tumor_Sample_Barcode[clinic$tumor_status == "TUMOR FREE"])
+
+
+lollipopPlot2(m1 = with_tumor_maf,
+              m2 = tumor_free_maf,
+              m1_name = "With Tumor",
+              m2_name = "Tumor Free",
+              gene = "TP53")
+title("TP53 Mutations: With Tumor vs Tumor Free")
+```
+Overall, there are no significant differences in mutations between the two variables, the mutations for with tumor side seems to concentrate around the DNA binding domain, but this might be due to the lack of sample sizes.
+
+*5*
+Create your Overall_Survival_Status column and create a mafSurvival KM plot based on mutations in your chosen gene.
+Does there seem to be a difference? Hypothesize why or not based on the other analysis you did with the gene above.
+```{r}
+clinic$Overall_Survival_Status <- ifelse(clinic$vital_status == "Dead", 1, 0)
+
+clinic$survival_time <- ifelse(clinic$death_days_to == "[Not Applicable]",
+                                clinic$last_contact_days_to,
+                                clinic$death_days_to)
+
+clinic$survival_time <- as.numeric(clinic$survival_time)
+
+maf_object <- read.maf(maf = maf,
+                       clinicalData = clinic,
+                       isTCGA = TRUE)
+
+mafSurvival(maf = maf_object,
+            genes = "TP53",
+            time = "survival_time",
+            Status = "Overall_Survival_Status",
+            isTCGA = TRUE)
+```
+The graph shows that those with mutation in the TP53 gene consistently had lower survival probability compared to those who doesn't, from day 0 to round 3000. The p value of 0.0737 indicates that this relation is boarderline statistically significant, and might become so with a larger dataset. This might be the case because from our explorations above, mutatiosn in the TP53 can increase the risk of developing tumors. 
