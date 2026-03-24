@@ -1,0 +1,217 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+ knitr::opts_knit$set(root.dir = normalizePath("/home1/bojialiu/490_Cluster/analysis_data/"))
+```
+
+```{r}
+if (!require("sesameData", quietly = TRUE))
+BiocManager::install("sesameData")
+
+if (!require("sesame", quietly = TRUE))
+BiocManager::install("sesame")
+
+if (!require("limma", quietly = TRUE))
+BiocManager::install("limma")
+```
+```{r}
+library(TCGAbiolinks)
+library(sesame)
+library(sesameData)
+library(limma)
+library(ggplot2)
+```
+
+```{r}
+query <- GDCquery(project = "TCGA-BRCA",
+                  data.category = "DNA Methylation",
+                  data.type = "Methylation Beta Value",
+                  platform = "Illumina Human Methylation 450",
+                  data.format = "Dataframe")
+```
+
+
+```{r}
+GDCdownload(query, method = "api", files.per.chunk = 5)
+methylation450 <- GDCprepare(query)
+```
+```{r}
+methylation_clinical <- as.data.frame(methylation450@colData)
+betas <- as.data.frame(methylation450@assays@data@listData) #takes a longer time
+cpg_sites <- as.data.frame(methylation450@rowRanges@elementMetadata)
+
+column_mask <- ifelse(colnames(methylation_clinical) %in% c('treatments', 'primary_site', 'disease_type','sites_of_involvement'), F, T)
+
+methylation_clinical <- methylation_clinical[,column_mask]
+write.csv(methylation_clinical, 'brca_methylation_clinical.csv')
+
+
+site_mask <- !grepl('-', cpg_sites$gene) & !grepl(';', cpg_sites$gene) & !is.na(cpg_sites$gene) & complete.cases(betas)
+betas <- betas[site_mask,]
+cpg_sites <- cpg_sites[site_mask,]
+
+write.csv(betas, 'brca_methylation_betas.csv') #takes a longer time
+write.csv(cpg_sites, 'brca_cpg_sites.csv')
+```
+
+Use the code below if you are loading in your data (i.e. you downloaded the data and closed the session, but you are back to continue working)
+```{r}
+methylation_clinical <- read.csv('brca_methylation_clinical.csv', row.names = 1)
+betas <- read.csv('brca_methylation_betas.csv', row.names=1)
+cpg_sites <- read.csv('brca_cpg_sites.csv', row.names = 1)
+```
+
+```{r}
+#(1) Naive Differential Methylation
+#masking out NAs
+na_mask <- !is.na(methylation_clinical$metastasis_at_diagnosis)
+methylation_clinical <- methylation_clinical[na_mask,]
+betas_clean <- betas[,na_mask]
+```
+
+
+
+```{r}
+
+
+#define your comparison and base group
+metastasis_mask <- methylation_clinical$metastasis_at_diagnosis== "Metastasis, NOS"
+methylation_clinical$nom <- ifelse(metastasis_mask, "Metastasis", "NoMetastasis")
+methylation_clinical$nom <- factor(methylation_clinical$nom, levels = c("NoMetastasis", "Metastasis"))
+
+#fitting linear models using a "target value"
+mval <- t(apply(betas_clean, 1, function(x) log2(x/(1-x)))) 
+#mvalue is another statistic for methylation, centered at 0 and ranges from -1 to 1
+#this step will take a few seconds to run
+
+design <- model.matrix(~ nom, data = methylation_clinical)
+fit <- lmFit(mval, design)
+fit2 <- eBayes(fit)
+```
+```{r}
+ncol(mval)
+nrow(design)
+nrow(methylation_clinical)
+ncol(betas_clean)
+```
+
+```{r}
+#Extracting model into dataframe
+dat <- data.frame(foldchange = fit[["coefficients"]][,2], logPvalue =  -log10(p.adjust(fit2[["p.value"]][,2],method='BY')), geneName = cpg_sites$gene)
+dat$threshold <- as.factor(abs(dat$foldchange) < 1)
+
+#Visualization
+cols <- c("TRUE" = "grey", "FALSE" = "blue")
+```
+
+
+```{r}
+ggplot(data=dat, aes(x=foldchange, y = logPvalue)) +
+  geom_point(alpha=.2, size=0.6) +
+  scale_colour_manual(values = cols) +
+  geom_vline(xintercept = 1, colour="#990000", linetype="dashed") + 
+  geom_vline(xintercept = - 1, colour="#990000", linetype="dashed") +
+  geom_hline(yintercept = 2, colour = "#990000", linetype="dashed") +
+  theme(legend.position="none") +
+  xlab("Fold Change") +
+  ylab("-log10 p value") +
+  theme_bw() +
+  theme(legend.position = "none")
+
+#Saving results to a .csv file
+write.csv(dat, "methylation_results_metastasis.csv")
+```
+In the volcano plot, we are interested in the genes that appear on the top right or the top left of the graph. These are genes that show a large fold change, and are statistically significant. They will be investigated further in the upcoming cells.
+
+```{r}
+de_results <- read.csv("methylation_results_metastasis.csv")
+
+rna_clinical <- read.csv("/home1/bojialiu/490_Cluster/analysis_data/brca_rna_clinical_data.csv", row.names = 1)
+rna_genes <- read.csv("/home1/bojialiu/490_Cluster/analysis_data/brca_rna_gene_data.csv")
+rna_counts <- read.csv("/home1/bojialiu/490_Cluster/analysis_data/brca_rna_count_data.csv", row.names = 1)
+```
+
+```{r}
+#Extract genes of interest
+downregulated <- de_results[(de_results$foldchange < -1), 'geneName']
+hypermethylated <- dat[dat$foldchange > 1.5, 'geneName'] #what cutoff should you use here?
+interest_genes <- intersect(downregulated, hypermethylated)
+```
+
+
+```{r}
+# ---- SETUP: Fix column names and filter NAs ----
+colnames(rna_counts) <- gsub("\\.", "-", colnames(rna_counts))
+colnames(betas) <- gsub("\\.", "-", colnames(betas))
+
+rna_clinical <- rna_clinical[!is.na(rna_clinical$metastasis_at_diagnosis), ]
+methylation_clinical <- methylation_clinical[!is.na(methylation_clinical$metastasis_at_diagnosis), ]
+
+# Get barcodes for each group
+metastasis_barcodes_rna <- rownames(rna_clinical)[rna_clinical$metastasis_at_diagnosis == "Metastasis, NOS"]
+no_metastasis_barcodes_rna <- rownames(rna_clinical)[rna_clinical$metastasis_at_diagnosis == "No Metastasis"]
+metastasis_barcodes_meth <- rownames(methylation_clinical)[methylation_clinical$metastasis_at_diagnosis == "Metastasis, NOS"]
+no_metastasis_barcodes_meth <- rownames(methylation_clinical)[methylation_clinical$metastasis_at_diagnosis == "No Metastasis"]
+
+# Verify
+sum(metastasis_barcodes_rna %in% colnames(rna_counts))
+sum(metastasis_barcodes_meth %in% colnames(betas))
+```
+
+```{r}
+# Keep as matrix for plotting (CpG sites x patients)
+methylation_m_matrix  <- betas[gene_betas_mask, metastasis_barcodes_meth]
+methylation_nm_matrix <- betas[gene_betas_mask, no_metastasis_barcodes_meth]
+
+# Collapsed to vector for boxplot (average across CpG sites)
+methylation_m  <- as.numeric(colMeans(methylation_m_matrix, na.rm=TRUE))
+methylation_nm <- as.numeric(colMeans(methylation_nm_matrix, na.rm=TRUE))
+```
+
+```{r}
+# ---- GENE OF INTEREST ----
+GENE <- "ERICH1"
+gene_counts_mask <- rna_genes$gene_name == GENE
+gene_betas_mask <- cpg_sites$gene == GENE
+
+# Extract RNA expression values
+rna_m  <- as.numeric(rna_counts[gene_counts_mask, metastasis_barcodes_rna])
+rna_nm <- as.numeric(rna_counts[gene_counts_mask, no_metastasis_barcodes_rna])
+
+# Extract methylation values - colMeans handles multiple CpG sites per gene
+methylation_m  <- as.numeric(colMeans(betas[gene_betas_mask, metastasis_barcodes_meth], na.rm=TRUE))
+methylation_nm <- as.numeric(colMeans(betas[gene_betas_mask, no_metastasis_barcodes_meth], na.rm=TRUE))
+
+# Verify lengths
+length(rna_m);        length(rna_nm)
+length(methylation_m); length(methylation_nm)
+```
+
+```{r}
+boxplot(rna_m, rna_nm, 
+        xlab='Group', ylab='Counts', 
+        names=c('Metastasis', 'No Metastasis'),
+        col=c("blue","red"),
+        main=paste("RNA Expression of", GENE, "by Metastasis Status"))
+```
+From the graph, we see that the median counts of this gene expression is roughly the same with patients on both classes. However, we do observe many instances of patient with no metastasis having this gene, ERICH1, expressed with a high number of counts(above 1500), this may indicate that ERICH1 has functions of tumour supression.
+```{r}
+plot(1:dim(methylation_m_matrix)[1], apply(methylation_m_matrix, 1, mean, na.rm=TRUE),
+     col='blue', type='h', lwd=3,
+     ylab='Average Beta', xlab='CpG sites',
+     main=paste("Methylation of", GENE, "by Metastasis Status"))
+lines(1.3:(dim(methylation_nm_matrix)[1]+0.3), apply(methylation_nm_matrix, 1, mean, na.rm=TRUE),
+      col='red', type='h', lwd=3)
+legend("topright",
+       legend=c("Metastasis", "No Metastasis"),
+       col=c("blue", "red"),
+       lwd=3,
+       cex=0.7)
+```
+The bar plot shows that beta values are roughtly matching for patients with metastasis and patients without on most CpG sites. There are two sites around CpG site 30 that shows a higher beta value in the metastatic patients, which might deserve future investigations.
+
+
+
